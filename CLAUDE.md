@@ -17,9 +17,15 @@ Three control surfaces sit on **one driver layer** (`app/sensors/*`):
 - **CLI** — every driver module runs standalone with argparse flags; the `light`/`water` shell
   wrappers (`bin/light.sh`, `bin/water.sh`) are what cron and the schedule feature call.
 
-The v2 code is on `main` of `iot-root/garden-of-eden`. `README.md` and `docs/INSTALL.md` still say
-it lives on a `v2-overhaul` branch of the `HeatherFlux` fork — that is stale. `docs/design.md`
-has the architecture rationale; `docs/maintenance.md` is the ops runbook.
+Upstream is `iot-root/garden-of-eden` (`main`); this repository is a fork of it: upstream's `main`
+plus merged feature branches. Upstream rebuilt its `main` in autumn 2026: the earlier squash
+commit (`883af53`, "feat/2.0.0") lives on as `upstream/archive/pre-rollforward-main` and is
+**not** an ancestor of the current `main`, so never rebase onto or diff against it. The
+roll-forward dropped CLAUDE.md, the boot-indicator service, release-please and `CHANGELOG.md`;
+upstream's open branch `chore/restore-rollforward-drops` would put all four back (its CLAUDE.md is
+the old 105-line one), so expect an add/add conflict on this file if that lands. `docs/INSTALL.md`
+still clones the `HeatherFlux` fork URL. `docs/design.md` has the architecture rationale;
+`docs/maintenance.md` is the ops runbook.
 
 ## Commands
 
@@ -43,9 +49,9 @@ python -m unittest tests.test_schedule.<TestCase>.<test_name> -v
 ```
 
 Use the `discover -t . -s tests` form or the dotted `tests.<module>` form: both import the `tests`
-package first, which installs the stubs. Plain `python -m unittest` from the repo root imports
-`app` before the stubs exist and fails with dozens of errors (the README's `python -m unittest`
-only works on a Pi with the real libs).
+package first, which installs the stubs and defaults `SENSOR_TYPE=DHT20` so the humidity and
+temperature routes can build. Plain `python -m unittest` from the repo root imports `app` before
+the stubs exist and fails with dozens of errors.
 
 Style: black, line length 100; ruff `E,F,I` with `E501`/`E402` ignored (`pyproject.toml`).
 `E402` is ignored on purpose — simulator and test bootstraps must seed env vars / stubs before
@@ -80,7 +86,10 @@ python app/sensors/distance/distance.py        # temperature / humidity / pcb_te
 # with PYTHONPATH=$PWD (bin/light.sh and bin/water.sh set it for you); otherwise
 # ModuleNotFoundError: No module named 'config'.
 light <off|on|0-100> | light ramp <brightness> <minutes> | water <off|on|seconds>
+./bin/schedule-reconcile.sh    # put the light where the saved schedule says it should be right now
 garden-update                  # bin/update.sh: git pull --ff-only, pip install, restart both services
+sudo -n /usr/bin/systemctl restart mqtt.service        # the two restarts the auto-update sudoers rule
+sudo -n /usr/bin/systemctl restart garden-api.service  # allows without a password (one unit per command)
 ```
 
 ## Architecture
@@ -99,10 +108,13 @@ route-only modules backed by `app/lib/` (`grow.py`, `pods.py`) or their own logi
 
 `app/__init__.py` (`create_app`) applies CORS, registers optional API-key auth, and mounts the
 blueprints: `/light`, `/pump`, `/distance`, `/temperature`, `/humidity`, `/pcb-temp`, `/camera`,
-`/schedule`, `/grow`, `/pods`, `/system`, the web UI at `/`, and `/health`. Adding a sensor = a
-new folder following the pattern + one `register_blueprint` line. The README's endpoint table is
-incomplete — `grep -rn '\.route(' app/` is the source of truth (e.g. `POST /pump/run`,
-`/camera/timelapse/<cam>`, `/pods`).
+`/schedule`, `/grow`, `/pods`, `/system`, the web UI at `/`, and `/health`. The route modules are
+imported **inside** `create_app`, not at package level, so importing `app` or a logic module such
+as `app.sensors.schedule.schedule` builds no hardware; importing a `routes` module or `mqtt` still
+does. Keep it that way — the CLIs and `bin/schedule-reconcile.sh` rely on it. Adding a sensor = a
+new folder following the pattern + one import and `register_blueprint` line inside `create_app`.
+The README's endpoint table is incomplete — `grep -rn '\.route(' app/` is the source of truth
+(e.g. `POST /pump/run`, `/camera/timelapse/<cam>`, `/pods`).
 
 ### Shared helpers (`app/lib/`)
 - `hardware.py` — `get_pin_factory()` returns the **one** process-wide `PiGPIOFactory` (honors
@@ -112,7 +124,10 @@ incomplete — `grep -rn '\.route(' app/` is the source of truth (e.g. `POST /pu
   `ValueError` (validation), pass-through for Flask `HTTPException`, **503** for anything else
   (hardware unavailable). `parse_level()` validates 0–100 request bodies.
 - `logging_config.py` — `configure_logging()`; level from `LOG_LEVEL`. Each process passes its
-  own file: `mqtt.py` → `mqtt.log`, `run.py` → `garden-api.log` (rotating 1 MB × 3).
+  own file: `mqtt.py` → `mqtt.log`, `run.py` → `garden-api.log` (rotating 1 MB × 3). Call it
+  **before** importing anything that constructs a driver: `run.py` does; `mqtt.py` still imports
+  the route modules first, so the drivers' import-time INFO lines (the "Preserving light
+  duty_cycle" message among them) never reach `mqtt.log`.
 - `persist.py` — `write_json_atomic()` (temp file + fsync + `os.replace`) used by every store
   below, so a power cut mid-write can't corrupt the SD card copy.
 - `state.py` (actuator state, `~/.garden_state.json`), `grow.py` (grow cycle + reminders,
@@ -134,11 +149,21 @@ crontab lines tagged `# garden-of-eden` that invoke `/usr/local/bin/light` and
 reduced profile plus a nightly `bin/schedule-refresh.sh` entry so it auto-expires. The MQTT
 service's `schedule/*/set` topics call the same `apply_schedule`.
 
-### Pump safety cap
-`MAX_PUMP_RUN_SECONDS` (default 300) is enforced independently in four places: the pump routes
-(auto-off timer on `/on`, `/speed`, `/run`), `schedule.py` (`_pump_seconds` clamp), `mqtt.py`
-(`_arm_pump_safety`), and `bin/water.sh` — which **hardcodes** `TIME_MAX=300` rather than reading
-config. Change them together.
+Cron is edge-triggered, so the schedule is also evaluated as a **level**:
+`desired_light_state(schedule, now)` returns the brightness of the most recent light edge in the
+past week (`None` with no schedule) and `reconcile_light()` does that for the saved schedule.
+`mqtt.py` applies it once per service start (see below) and `bin/schedule-reconcile.sh` does the
+same from a shell; both touch only the light, never the pump.
+
+### Pump run cap
+`MAX_PUMP_RUN_SECONDS` (default **900** since the roll-forward; it was 300) is enforced
+independently in four places: the pump routes (auto-off timer on `/on`, `/speed`, `/run`; `/run`
+rejects longer requests with 400), `schedule.py` (`_pump_seconds` clamp), `mqtt.py`
+(`_arm_pump_safety`, and the maximum of the HA "Pump Run Duration" number), and `bin/water.sh`,
+which reads `MAX_PUMP_RUN_SECONDS` from the environment or the repo `.env` and falls back to 900.
+The web UI (`app/web/index.html`) hardcodes 900 s / 15 min in its inputs and hints, so a unit
+whose `.env` pins a lower cap (installs from before the roll-forward have `300`) keeps that cap
+everywhere except the UI's input limits, and the API answers 400 to a too-long `/run`.
 
 ### mqtt.py specifics
 - Reuses the **singleton drivers created by the route modules** (`from app.sensors.light.routes
@@ -160,20 +185,35 @@ config. Change them together.
   publish `{"event_type": …}` to `BASE_TOPIC/button/event` (an HA `event` entity). Gotcha:
   `hold_time` (2 s) is longer than the double-press window (1 s), so a long press also fires the
   single-press light toggle first.
-- Power-loss recovery: `restore_actuator_state` runs on connect (the `on_connect` callback is
-  re-assigned *after* `client.connect()` but before `loop_forever()` — keep that ordering).
-  `graceful_shutdown` turns the pump off on SIGTERM/SIGINT. State is persisted by the REST routes
-  and the button toggles via `app.lib.state`; the MQTT command handlers currently do **not**
-  persist, and `water/low/cm/set` only mutates a module global (lost on restart).
-- **Service starts are destructive, and a dead broker makes them constant.** Constructing
-  `Light`/`Pump` starts gpiozero PWM, which writes the pin LOW and sets duty 0 (verified by
-  simulation against a fake pigpio). That happens at import in every start of `mqtt.service` and
-  `garden-api.service`. `mqtt.py` uses a blocking `client.connect()`, so an unreachable broker
-  kills the process and systemd (`Restart=always`, `RestartSec=5`, no start limit) relaunches it
-  forever, zeroing the light and pump every few seconds and overriding whatever cron set. Keep
-  `MQTT_BROKER=localhost` (the Pi's own mosquitto) until this is fixed; reach Home Assistant
-  through a mosquitto bridge instead. Cron-driven changes are also never persisted, so
-  `restore_actuator_state` cannot put back a light that cron turned on.
+- Power-loss recovery: `_on_connect_and_restore` (assigned to `client.on_connect` *after*
+  `client.connect()` but before `loop_forever()` — keep that ordering) runs `on_connect`, then
+  `restore_actuator_state`, then — once per process — `reconcile_schedule` in a daemon thread.
+  That waits up to 5 min for `timedatectl` to report `NTPSynchronized=yes` (a Zero W has no RTC
+  and boots with a stale clock), then sets the light to `sched_lib.reconcile_light()`, publishes
+  the light topics and saves state: the schedule wins over persisted state when it has an opinion
+  and does nothing when it has none. `graceful_shutdown` turns the pump off on SIGTERM/SIGINT and
+  deliberately leaves the light alone (pigpiod keeps the PWM running after the process exits).
+  State is persisted by the REST routes and the button toggles via `app.lib.state`; the MQTT
+  command handlers currently do **not** persist, and `water/low/cm/set` only mutates a module
+  global (lost on restart). Pump state is restored too: `/pump/on` and `/pump/run` save
+  `pump_on: true` and the API's auto-off timer saves `false`, so a power cut mid-run leaves `true`
+  behind and the next `mqtt.service` start runs the pump for a full cap period.
+- **Constructing a driver zeroes its pin, and a dead broker makes that constant.** Starting
+  gpiozero PWM writes the pin LOW and sets duty 0 (verified by simulation against a fake pigpio),
+  and it happens at import in every start of `mqtt.service` and `garden-api.service`. `Light`
+  now reads the duty pigpiod is already running (`get_PWM_dutycycle` / `get_PWM_range`) before
+  gpiozero takes the pin and re-applies it ("Preserving light duty_cycle of N% across restart"),
+  so service restarts leave the grow light alone — verified on hardware 2026-11-05. `Pump` has no
+  such guard: a restart during a cron `water` run stops the pump early (harmless; the `--off`
+  still runs). `mqtt.py` still uses a blocking `client.connect()`, so an unreachable broker kills
+  the process and systemd (`Restart=always`, `RestartSec=5`, no start limit) relaunches it
+  forever; the `Light` guard means that no longer darkens the garden, but it still zeroes the pump
+  pin and burns CPU every few seconds. Keep `MQTT_BROKER=localhost` (the Pi's own mosquitto)
+  until this is fixed; reach Home Assistant through a mosquitto bridge or a password-protected
+  LAN listener on the Pi's broker instead. Cron-driven changes are never persisted, which is why
+  the light is reconciled from the schedule rather than from `~/.garden_state.json`. Upstream's
+  open branch `fix/light-state-button` carries an equivalent `Light` guard plus button/MQTT state
+  fixes; expect a conflict in `light.py` when it lands.
 - **Two processes own the same sensors.** `garden-api` and `mqtt.service` each construct their own
   `DistanceSensor` on GPIO 26/19 (and `Light`/`Pump`). Observed on hardware (2026-10-28): the API
   process's `distance` froze at one value for a week (gpiozero's smoothed background queue stopped
@@ -203,9 +243,12 @@ and the schedule validation. The built-in web UI is a superset of the app.
   fswebcam, ffmpeg, mosquitto, avahi, openssh), creates `venv/`, enables I2C, auto-detects
   `SENSOR_TYPE` (writes it to `.env`), enables SSH and mDNS (`GARDEN_HOSTNAME`, default `gardyn`),
   symlinks `light`/`water`/`garden-update`, installs camera udev rules, and installs systemd units:
-  `mqtt.service`, `garden-api.service` (waitress), `garden-boot-indicator.service` (pulses the
-  lights on power-on), and `garden-autoupdate.timer` (~03:30 nightly `bin/autoupdate.sh`, with a
-  scoped sudoers rule). `bin/uninstall.sh` reverses it. It installs **no cron jobs**; the only
+  `mqtt.service`, `garden-api.service` (waitress), and `garden-autoupdate.timer` (~03:30 nightly
+  `bin/autoupdate.sh`, with a sudoers rule limited to restarting the two services — also the
+  password-less deploy path listed under "On the Pi"). The boot-indicator service (lights pulsed
+  on power-on) was removed in the roll-forward; a unit installed before it still has
+  `garden-boot-indicator.service` enabled and pointing at a script that no longer exists —
+  disable it. `bin/uninstall.sh` reverses the install. It installs **no cron jobs**; the only
   crontab writer is the schedule feature. **Its last step (`verify_api`) runs `bin/api-test.sh`
   with output discarded, and that script drives real hardware**: light to 30 %, 0, full on, off;
   pump to 30 %, 0, `/pump/on` (**100 % duty**), off, then 30 % and 10 %, about a second each. So a
@@ -217,9 +260,13 @@ and the schedule validation. The built-in web UI is a superset of the app.
   and an optional mosquitto `broker`; containers reach the host's `pigpiod` via
   `PIGPIO_HOST=host.docker.internal`, so no privileged GPIO access is needed.
 - `requirements.txt` is the pinned Pi/runtime set (versions chosen for ARM wheels — be cautious
-  bumping); `requirements-dev.txt` is pure-Python for CI. Tooling targets Python 3.9+ (`pyproject`,
-  CI matrix 3.9/3.11; `logging.basicConfig(force=True)` needs ≥3.8). The README's "3.6+" is
-  historical. Verified on hardware 2026-09: a Pi Zero W on Raspberry Pi OS Lite **Trixie** 32-bit
+  bumping); `requirements-dev.txt` is pure-Python for CI. **`waitress` is missing from it** since
+  the roll-forward while `setup.sh` still writes `ExecStart=…/waitress-serve` into
+  `garden-api.service`, so a fresh install from `main` gets an API service that cannot start until
+  `venv/bin/pip install waitress` is run (upstream's `fix/api-waitress-dependency` branch restores
+  the pin; units installed earlier still have it). Tooling targets Python 3.9+ (`pyproject`, CI
+  matrix 3.9/3.11; `logging.basicConfig(force=True)` needs ≥3.8). Verified on hardware 2026-09: a
+  Pi Zero W on Raspberry Pi OS Lite **Trixie** 32-bit
   (Python 3.13) installs and runs cleanly — `pigpio` 1.78 comes from the Raspbian repo (Raspberry
   Pi's own trixie archive dropped it) and every compiled pin has a cp313 wheel on piwheels. On
   that image `sudo` prompts for a password, so `setup.sh` can stall on a prompt after the long
@@ -250,10 +297,17 @@ and the schedule validation. The built-in web UI is a superset of the app.
 ## Commit & PR conventions
 
 - Conventional Commits (`CONTRIBUTORS.md`): `<type>(<scope>): <description>` with type ∈
-  `feat|fix|docs|style|refactor|test|chore`, `!` + `BREAKING CHANGE:` footer for breaking changes.
-  `release-please` builds `CHANGELOG.md` and version tags from these on every push to `main` —
-  never edit the changelog by hand.
+  `feat|fix|docs|style|refactor|test|chore`, `!` + `BREAKING CHANGE:` footer for breaking changes,
+  `Refs: #<issue>` in the footer. There is no release automation or changelog on `main` any more
+  (release-please and `CHANGELOG.md` went with the roll-forward).
 - PR titles are checked by `enforce-pr-title.yml`: must start with one of
   `feat, fix, hotfix, jira, doc, test, proj-, ci` (case-insensitive) and be 5–50 characters.
   Note `chore:`/`refactor:`/`style:` PR titles **fail** this check even though they are valid
   commit types.
+- The README's "Developing" section says to branch from and open PRs against `dev`, merging with
+  merge commits rather than squashes. As of November 2026 upstream's `dev` is a 2023 branch that
+  is not an ancestor of `main`, while CI and the title check run on `main`; confirm the target
+  with upstream before opening a PR there. In this fork, feature branches merge into `main` with
+  `--no-ff` merge commits.
+- `tasks/` (plans and bench notes that include LAN and login details) is kept out of the
+  repository through `.git/info/exclude`; never force-add it.
