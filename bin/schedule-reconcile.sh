@@ -10,8 +10,11 @@ set -euo pipefail
 GOE_PATH=$(realpath "$(dirname "$(readlink -e "${0}")")/..")
 export PYTHONPATH="${GOE_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
 
+# Only the last line is the answer; anything a driver prints while importing
+# must not end up in ${desired}.
 desired=$("${GOE_PATH}/venv/bin/python" -c \
-    "from app.sensors.schedule import schedule as s; d = s.reconcile_light(); print('none' if d is None else d)")
+    "from app.sensors.schedule import schedule as s; d = s.reconcile_light(); print('none' if d is None else d)" \
+    | tail -n 1)
 
 case "${desired}" in
     none) echo "no light schedule to reconcile against" ;;
