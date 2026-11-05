@@ -76,6 +76,9 @@ python mqtt.py                 # normally started by systemd
 python app/sensors/light/light.py [--on] [--off] [--brightness 0-100] [--ramp-minutes N]
 python app/sensors/pump/pump.py  [--on] [--off] [--speed 0-100] [--factory-host H --factory-port P]
 python app/sensors/distance/distance.py        # temperature / humidity / pcb_temp likewise
+# The driver scripts `import config` from the repo root but do not fix up sys.path, so run them
+# with PYTHONPATH=$PWD (bin/light.sh and bin/water.sh set it for you); otherwise
+# ModuleNotFoundError: No module named 'config'.
 light <off|on|0-100> | light ramp <brightness> <minutes> | water <off|on|seconds>
 garden-update                  # bin/update.sh: git pull --ff-only, pip install, restart both services
 ```
@@ -171,6 +174,12 @@ config. Change them together.
   `MQTT_BROKER=localhost` (the Pi's own mosquitto) until this is fixed; reach Home Assistant
   through a mosquitto bridge instead. Cron-driven changes are also never persisted, so
   `restore_actuator_state` cannot put back a light that cron turned on.
+- **Two processes own the same sensors.** `garden-api` and `mqtt.service` each construct their own
+  `DistanceSensor` on GPIO 26/19 (and `Light`/`Pump`). Observed on hardware (2026-10-28): the API
+  process's `distance` froze at one value for a week (gpiozero's smoothed background queue stopped
+  updating) while `mqtt.py`'s readings stayed live, so the web UI's water level was stale and
+  the HA/MQTT value was right. Restarting `garden-api.service` clears it. The real fix is one
+  owner per sensor with the API reading published state.
 - Tests drive it offline: `tests/test_mqtt_control.py` and `tests/test_discovery.py` import
   `mqtt` under the stubs and call `on_message` / `send_discovery_messages` with a fake client.
 
@@ -230,8 +239,11 @@ and the schedule validation. The built-in web UI is a superset of the app.
   which is why `detect_model()` also falls back to `SENSOR_TYPE`.
 - Pump `speed` maps 1:1 to PWM duty (0–100 %) and **nothing in code caps it**: `on()` sets 100 %
   despite its "30 percent" docstring (true since the first commit), `DEFAULT_PUMP_SPEED` is 100,
-  and the HA pump entity commands 0–100. The README's "max duty 30 %" is an unenforced hardware
-  note. The distance driver averages the median of several samples and raises `MeasurementError`.
+  and the HA pump entity commands 0–100. The README's "max duty 30 %, full on overdraws the
+  supply" claim is unenforced and, measured on a Gardyn 3.0-style unit (2026-09), unfounded:
+  100 % draws 0.77 A with the 12 V rail unmoved, even with the lights at full. The INA219 sees
+  only the pump, and `pump_power.py` samples it single-shot against 50 Hz PWM, so `/pump/stats`
+  reads ~0 mA at any duty below 100 %; real measurements need `ADC_128SAMP` averaging. The distance driver averages the median of several samples and raises `MeasurementError`.
 - Cameras are `/dev/video0` / `/dev/video2` by default; `services/etc/udev/rules.d/` pins them to
   `/dev/gardyn-upper` / `/dev/gardyn-lower` by USB port once edited for the unit.
 
