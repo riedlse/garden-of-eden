@@ -55,5 +55,30 @@ class TestLight(unittest.TestCase):
         self.mock_led.close.assert_called_once()
 
 
+class TestLightPreservesRunningDuty(unittest.TestCase):
+    """Constructing Light must not switch off a light pigpiod is already driving."""
+
+    @patch("app.sensors.light.light.PWMLED")
+    @patch("app.sensors.light.light.PiGPIOFactory")
+    @patch("app.sensors.light.light.pigpio.pi")
+    def test_restores_duty_already_running(self, MockPi, MockFactory, MockPWMLED):
+        MockPi.return_value.get_PWM_dutycycle.return_value = 6000
+        MockPi.return_value.get_PWM_range.return_value = 10000
+        led = MockPWMLED.return_value
+        led.value = 0  # what gpiozero leaves behind when it starts PWM
+        Light(18)
+        self.assertEqual(led.value, 0.6)
+
+    @patch("app.sensors.light.light.PWMLED")
+    @patch("app.sensors.light.light.PiGPIOFactory")
+    @patch("app.sensors.light.light.pigpio.pi")
+    def test_leaves_pin_alone_when_not_running_pwm(self, MockPi, MockFactory, MockPWMLED):
+        MockPi.return_value.get_PWM_dutycycle.side_effect = Exception("GPIO is not in use for PWM")
+        led = MockPWMLED.return_value
+        led.value = 0
+        Light(18)
+        self.assertEqual(led.value, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

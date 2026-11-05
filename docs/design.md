@@ -49,3 +49,10 @@ quad-core) — see [pizero2-upgrade.md](pizero2-upgrade.md).
   unavailable" (503) so clients aren't told a disconnected sensor succeeded.
 - Actuator + grow state is persisted and restored on boot for power-loss
   recovery (#3); `mqtt.py` turns the pump off cleanly on SIGTERM.
+- The light schedule is **level-based at startup**, not just edge-based: cron
+  only fires at the on/off times, so after a power cut `mqtt.py` re-derives what
+  the light should be doing *now* (`schedule.desired_light_state`) once it starts
+  and the clock is NTP-synced, and applies it. `Light` also preserves a duty that
+  pigpiod is already running when it is constructed, so a plain service restart
+  no longer switches the grow light off. `bin/schedule-reconcile.sh` does the
+  same from a shell.

@@ -5,6 +5,7 @@ state / schedule toggles and echo the new state back. crontab writes are stubbed
 so nothing touches the host, and the state files live in a temp dir.
 """
 
+import datetime
 import os
 import tempfile
 import unittest
@@ -140,3 +141,69 @@ class MqttControlTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReconcileScheduleTestCase(unittest.TestCase):
+    """After a (re)start the light is put where the schedule says it should be."""
+
+    @classmethod
+    def setUpClass(cls):
+        import config
+        import mqtt
+
+        cls.mqtt = mqtt
+        cls.config = config
+        cls.base = mqtt.BASE_TOPIC
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.config.SCHEDULE_FILE = os.path.join(self.tmp, "sched.json")
+        self.config.STATE_FILE = os.path.join(self.tmp, "state.json")
+        self.client = FakeClient()
+        self.mqtt.light.off()
+
+    def _save_everyday(self, on="06:00", off="21:00", brightness=60, enabled=True):
+        self.mqtt.sched_lib.save_schedule(
+            {
+                "lights": {
+                    "enabled": enabled,
+                    "days": {
+                        d: [{"onTime": on, "offTime": off, "brightness": brightness}]
+                        for d in self.mqtt.sched_lib.DAYS
+                    },
+                },
+                "pump": {"enabled": False},
+            }
+        )
+
+    def published(self, suffix):
+        return [p for t, p in self.client.published if t == f"{self.base}/{suffix}"]
+
+    def test_turns_light_on_inside_window(self):
+        self._save_everyday()
+        noon = datetime.datetime(2026, 11, 5, 12, 0)
+        self.assertEqual(
+            self.mqtt.reconcile_schedule(self.client, now=noon, wait_for_clock=False), 60
+        )
+        self.assertEqual(self.mqtt.light.get_brightness(), 60)
+        self.assertIn("ON", self.published("light/state"))
+        self.assertIn("60", self.published("light/brightness/state"))
+        self.assertTrue(self.mqtt.state_lib.load_state()["light_on"])
+
+    def test_turns_light_off_outside_window(self):
+        self._save_everyday()
+        self.mqtt.light.set_duty_cycle(60)  # e.g. restored from persisted state
+        late = datetime.datetime(2026, 11, 5, 23, 0)
+        self.assertEqual(
+            self.mqtt.reconcile_schedule(self.client, now=late, wait_for_clock=False), 0
+        )
+        self.assertEqual(self.mqtt.light.get_brightness(), 0)
+        self.assertIn("OFF", self.published("light/state"))
+
+    def test_no_schedule_leaves_light_alone(self):
+        self._save_everyday(enabled=False)
+        self.mqtt.light.set_duty_cycle(40)
+        noon = datetime.datetime(2026, 11, 5, 12, 0)
+        self.assertIsNone(self.mqtt.reconcile_schedule(self.client, now=noon, wait_for_clock=False))
+        self.assertEqual(self.mqtt.light.get_brightness(), 40)
+        self.assertEqual(self.client.published, [])

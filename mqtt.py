@@ -1085,6 +1085,75 @@ def publish_images(client):
         sleep(IMAGE_INTERVAL_SECONDS)
 
 
+_reconcile_done = False
+
+
+def _wait_for_time_sync(timeout=300, poll=10):
+    """Return once the clock is NTP-synchronised, or after ``timeout`` seconds.
+
+    A Pi Zero W has no RTC: after a power cut it boots with a stale clock and
+    only corrects once the network is back. Reconciling before that would apply
+    the wrong part of the schedule. Hosts without timedatectl count as synced.
+    """
+    waited = 0
+    while True:
+        try:
+            result = subprocess.run(
+                ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except FileNotFoundError:
+            return True
+        except Exception as exc:
+            logger.warning("timedatectl failed (%s); assuming the clock is fine", exc)
+            return True
+        if result.stdout.strip() == "yes":
+            return True
+        if waited >= timeout:
+            return False
+        sleep(poll)
+        waited += poll
+
+
+def reconcile_schedule(client, now=None, wait_for_clock=True):
+    """Put the light where the saved schedule says it should be right now.
+
+    Cron only fires at the edges and every service start zeroes the PWM
+    outputs, so after a power cut or restart the light would otherwise stay
+    off (or on) until the next scheduled edge. Runs once per process start,
+    after ``restore_actuator_state``: the schedule wins over persisted state
+    when it has an opinion and leaves things alone when it has none.
+    """
+    global light_state, brightness
+    if wait_for_clock and not _wait_for_time_sync():
+        logger.warning("Clock not NTP-synchronised after waiting; reconciling the schedule anyway")
+    try:
+        desired = sched_lib.reconcile_light(now)
+    except Exception as exc:
+        logger.error("Could not evaluate the schedule for reconciliation: %s", exc)
+        return None
+    if desired is None:
+        logger.info("No light schedule to reconcile against")
+        return None
+    try:
+        if desired > 0:
+            light.set_duty_cycle(desired)
+            light_state, brightness = True, desired
+            client.publish(BASE_TOPIC + "/light/state", "ON")
+            client.publish(BASE_TOPIC + "/light/brightness/state", str(desired))
+        else:
+            light.off()
+            light_state = False
+            client.publish(BASE_TOPIC + "/light/state", "OFF")
+        state_lib.save_state(light_on=desired > 0, brightness=brightness)
+        logger.info("Reconciled light to %s%% per schedule", desired)
+    except Exception as exc:
+        logger.error("Failed to reconcile the light: %s", exc)
+    return desired
+
+
 def restore_actuator_state(client):
     """Restore light/pump to their last persisted state after a restart (#3)."""
     global light_state, pump_state, brightness, speed
@@ -1184,10 +1253,16 @@ if __name__ == "__main__":
     grow_thread.daemon = True
     grow_thread.start()
 
-    # Restore last known actuator state after (re)connect.
-    client.on_connect = lambda c, u, f, rc, properties=None: (
-        on_connect(c, u, f, rc, properties),
-        restore_actuator_state(c),
-    )
+    # Restore last known actuator state after (re)connect, then (once per
+    # process) put the light where the schedule says it should be right now.
+    def _on_connect_and_restore(c, u, f, rc, properties=None):
+        global _reconcile_done
+        on_connect(c, u, f, rc, properties)
+        restore_actuator_state(c)
+        if not _reconcile_done:
+            _reconcile_done = True
+            threading.Thread(target=reconcile_schedule, args=(c,), daemon=True).start()
+
+    client.on_connect = _on_connect_and_restore
 
     client.loop_forever()
