@@ -36,9 +36,28 @@ class Light:
         # Note: for docker: PiGPIOFactory(host='pigpiod', port=8888)
         self.pin = pin
         self.pin_factory = pin_factory if pin_factory else PiGPIOFactory()
-        self.led = PWMLED(self.pin, pin_factory=self.pin_factory)
+        # Look at the pin *before* gpiozero takes it over: starting PWM through
+        # gpiozero writes the pin low and sets duty 0, which is why every service
+        # (re)start used to switch the grow light off. Remember the duty pigpiod
+        # is already running and put it back once PWM is set up.
         self.gpio = GPIOController(pin, pin_factory)
+        previous = self._running_duty()
+        self.led = PWMLED(self.pin, pin_factory=self.pin_factory)
         self.set_frequency(frequency)
+        if previous:
+            logging.info("Preserving light duty_cycle of %.0f%% across restart", previous * 100)
+            self.led.value = previous
+
+    def _running_duty(self):
+        """Duty (0..1) the pin is already running via pigpiod, or ``None``."""
+        try:
+            duty = self.gpio.pi.get_PWM_dutycycle(self.pin)
+            span = self.gpio.pi.get_PWM_range(self.pin)
+        except Exception:
+            return None  # pigpio raises when the pin is not running PWM
+        if not isinstance(duty, (int, float)) or not isinstance(span, (int, float)) or span <= 0:
+            return None
+        return max(0.0, min(1.0, duty / span))
 
     def on(self):
         """

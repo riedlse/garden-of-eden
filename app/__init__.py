@@ -5,23 +5,28 @@ from flask_cors import CORS
 
 import config
 
-from .sensors.camera.routes import camera_blueprint
-from .sensors.distance.routes import distance_blueprint
-from .sensors.grow.routes import grow_blueprint
-from .sensors.humidity.routes import humidity_blueprint
-from .sensors.light.routes import light_blueprint
-from .sensors.pcb_temp.routes import pcb_temp_blueprint
-from .sensors.pods.routes import pods_blueprint
-from .sensors.pump.routes import pump_blueprint
-from .sensors.schedule.routes import schedule_blueprint
-from .sensors.system.routes import system_blueprint
-from .sensors.temperature.routes import temperature_blueprint
-from .web.routes import web_blueprint
-
 logger = logging.getLogger(__name__)
 
 
 def create_app(config_name=None):
+    # The route modules construct their hardware drivers at import time. Import
+    # them here rather than at package level so that merely importing something
+    # under ``app`` (a CLI pulling in ``app.sensors.schedule.schedule``, the
+    # nightly schedule refresh, a test helper) does not start PWM on the light
+    # and pump pins or spin up the ultrasonic sensor in that process.
+    from .sensors.camera.routes import camera_blueprint
+    from .sensors.distance.routes import distance_blueprint
+    from .sensors.grow.routes import grow_blueprint
+    from .sensors.humidity.routes import humidity_blueprint
+    from .sensors.light.routes import light_blueprint
+    from .sensors.pcb_temp.routes import pcb_temp_blueprint
+    from .sensors.pods.routes import pods_blueprint
+    from .sensors.pump.routes import pump_blueprint
+    from .sensors.schedule.routes import schedule_blueprint
+    from .sensors.system.routes import system_blueprint
+    from .sensors.temperature.routes import temperature_blueprint
+    from .web.routes import web_blueprint
+
     app = Flask(__name__)
 
     # CORS lives here (not run.py) so the test client and any WSGI host get

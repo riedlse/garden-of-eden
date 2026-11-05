@@ -254,3 +254,80 @@ def refresh():
         schedule["vacation"] = vacation
         logger.info("Vacation mode expired; reverting to the normal schedule")
     return apply_schedule(schedule)
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation: what the light *should* be doing right now.
+#
+# Cron only fires at the on/off edges. After a power cut, a service restart
+# (starting PWM zeroes the outputs) or a clock jump, the light therefore stays
+# wrong until the next edge -- a 7 am power blip means a dark day. These helpers
+# derive the level-based answer ("on at 60 % now") from the same schedule the
+# cron lines are compiled from, so callers can re-apply it at startup.
+# ---------------------------------------------------------------------------
+
+
+def _minute_of_day(value):
+    minute, hour = _hh_mm(value)
+    return hour * 60 + minute
+
+
+def light_events(schedule):
+    """Return the light transitions the compiled crontab fires each week.
+
+    Each item is ``(weekday, minute_of_day, brightness)``, with ``weekday`` as
+    ``datetime.weekday()`` numbers (Monday = 0) and ``brightness`` 0 for "off".
+    Order matches the cron lines, so a tie at the same minute resolves the way
+    cron does (the later line runs last). Ramped windows report their target.
+    """
+    schedule = normalize_schedule(schedule)
+    events = []
+    if is_vacation_active(schedule):
+        for weekday in range(len(DAYS)):
+            for window in VACATION_PROFILE["lights"]:
+                events.append(
+                    (weekday, _minute_of_day(window["onTime"]), int(window["brightness"]))
+                )
+                events.append((weekday, _minute_of_day(window["offTime"]), 0))
+        return events
+
+    lights = schedule["lights"]
+    if not lights["enabled"]:
+        return events
+    for weekday, day in enumerate(DAYS):
+        for window in lights["days"][day]:
+            brightness = int(window.get("brightness", 70))
+            events.append((weekday, _minute_of_day(window.get("onTime", "08:00")), brightness))
+            events.append((weekday, _minute_of_day(window.get("offTime", "22:00")), 0))
+    return events
+
+
+def desired_light_state(schedule, now=None):
+    """Brightness the light should have at ``now`` (0 = off), or ``None`` when
+    the schedule has no light transitions and so expresses no opinion.
+
+    Picks the most recent transition in the past week: the state the light
+    would be in had every cron edge fired. A transition at the current minute
+    counts as fired, since cron runs at the top of the minute.
+    """
+    events = light_events(schedule)
+    if not events:
+        return None
+    now = now or datetime.datetime.now()
+    now_minute = now.hour * 60 + now.minute
+    week = 7 * 24 * 60
+    best_age, best = None, None
+    for weekday, minute, brightness in events:
+        age = ((now.weekday() - weekday) % 7) * 24 * 60 + (now_minute - minute)
+        if age < 0:
+            age += week
+        # ``<=``: at equal age the later cron line wins, as it does in cron.
+        if best_age is None or age <= best_age:
+            best_age, best = age, brightness
+    return best
+
+
+def reconcile_light(now=None):
+    """Load the saved schedule and return the brightness the light should have
+    now (see ``desired_light_state``)."""
+    return desired_light_state(load_schedule(), now)

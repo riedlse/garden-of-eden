@@ -146,3 +146,80 @@ class NormalizeScheduleTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DesiredLightStateTestCase(unittest.TestCase):
+    """Level-based view of the schedule: what the light should be doing *now*."""
+
+    # 2026-11-05 is a Thursday; 2026-11-02 a Monday; 2026-11-08 a Sunday.
+    WINDOW = {"onTime": "06:00", "offTime": "21:00", "brightness": 60}
+
+    def _everyday(self, enabled=True, window=None):
+        w = window or self.WINDOW
+        return {
+            "lights": {"enabled": enabled, "days": {d: [dict(w)] for d in sched.DAYS}},
+            "pump": {"enabled": False},
+        }
+
+    def at(self, *args):
+        return datetime.datetime(*args)
+
+    def test_no_schedule_means_no_opinion(self):
+        self.assertIsNone(sched.desired_light_state({}, self.at(2026, 11, 5, 12, 0)))
+        self.assertIsNone(
+            sched.desired_light_state(self._everyday(enabled=False), self.at(2026, 11, 5, 12, 0))
+        )
+
+    def test_inside_window_is_on_at_brightness(self):
+        self.assertEqual(
+            sched.desired_light_state(self._everyday(), self.at(2026, 11, 5, 12, 0)), 60
+        )
+
+    def test_outside_window_is_off(self):
+        s = self._everyday()
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 5, 5, 30)), 0)
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 5, 21, 30)), 0)
+
+    def test_edge_minute_counts_as_fired(self):
+        s = self._everyday()
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 5, 6, 0, 30)), 60)
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 5, 21, 0, 0)), 0)
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 5, 5, 59, 59)), 0)
+
+    def test_overnight_window(self):
+        s = self._everyday(window={"onTime": "20:00", "offTime": "06:00", "brightness": 80})
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 5, 23, 0)), 80)
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 6, 3, 0)), 80)
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 6, 7, 0)), 0)
+
+    def test_single_weekday_window_holds_until_its_off_edge(self):
+        s = {
+            "lights": {
+                "enabled": True,
+                "days": {"mon": [{"onTime": "08:00", "offTime": "22:00", "brightness": 70}]},
+            },
+            "pump": {"enabled": False},
+        }
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 2, 12, 0)), 70)  # Monday
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 4, 12, 0)), 0)  # Wednesday
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 8, 12, 0)), 0)  # Sunday
+
+    def test_vacation_profile_wins(self):
+        s = self._everyday()
+        s["vacation"] = {"enabled": True, "until": None}
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 5, 12, 0)), 50)
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 5, 17, 0)), 0)
+
+    def test_legacy_single_window_shape(self):
+        s = {"lights": {"enabled": True, "onTime": "06:00", "offTime": "21:00", "brightness": 60}}
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 5, 12, 0)), 60)
+
+    def test_ramped_window_reports_target(self):
+        s = self._everyday(window=dict(self.WINDOW, rampMinutes=30))
+        self.assertEqual(sched.desired_light_state(s, self.at(2026, 11, 5, 6, 10)), 60)
+
+    def test_light_events_mirror_cron_lines(self):
+        events = sched.light_events(self._everyday())
+        self.assertEqual(len(events), 14)  # on + off, every day
+        self.assertIn((3, 6 * 60, 60), events)  # Thursday 06:00 on
+        self.assertIn((3, 21 * 60, 0), events)  # Thursday 21:00 off
